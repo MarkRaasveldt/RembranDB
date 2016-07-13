@@ -26,7 +26,6 @@ static void Initialize(void);
 static char* ReadQuery(void);
 static Table *ExecuteQuery(Query *query);
 static void Cleanup(void); 
-static LLVMPassManagerRef InitializePassManager(LLVMModuleRef module);
 
 static bool enable_optimizations = false;
 static bool print_result = true;
@@ -34,81 +33,200 @@ static bool print_llvm = true;
 static bool execute_statement = false;
 static char* statement;
 
+// long long loop(double* result, double **inputs, long long size)
+// returns: number of elements inserted
+typedef lng (*fptr)(double*,double**,lng);
+
+static LLVMPassManagerRef InitializePassManager(LLVMModuleRef module);
+
+static LLVMValueRef
+PerformOperation(Operation *op, LLVMBuilderRef builder, LLVMValueRef index) {
+    if (op->type == OPTYPE_binop) {
+        BinaryOperation *binop = (BinaryOperation*) op;
+        LLVMValueRef left = PerformOperation(binop->left, builder, index);
+        LLVMValueRef right = PerformOperation(binop->right, builder, index);
+        switch(binop->optype) {
+            case OPTYPE_mul: return LLVMBuildFMul(builder, left, right, "x*y");
+            case OPTYPE_div: return LLVMBuildFDiv(builder, left, right, "x/y");
+            case OPTYPE_add: return LLVMBuildFAdd(builder, left, right, "x+y");
+            case OPTYPE_sub: return LLVMBuildFSub(builder, left, right, "x-y");
+            case OPTYPE_lt:  return LLVMBuildFCmp(builder, LLVMRealOLT, left, right, "x<y");
+            case OPTYPE_le:  return LLVMBuildFCmp(builder, LLVMRealOLE, left, right, "x<y");
+            case OPTYPE_eq:  return LLVMBuildFCmp(builder, LLVMRealOEQ, left, right, "x<y");
+            case OPTYPE_ne:  return LLVMBuildFCmp(builder, LLVMRealONE, left, right, "x<y");
+            case OPTYPE_gt:  return LLVMBuildFCmp(builder, LLVMRealOGT, left, right, "x<y");
+            case OPTYPE_ge:  return LLVMBuildFCmp(builder, LLVMRealOGE, left, right, "x<y");
+            case OPTYPE_and: return LLVMBuildAnd(builder, left, right, "x && y");
+            case OPTYPE_or:  return LLVMBuildOr(builder, left, right, "x || y");
+        }
+    } else if (op->type == OPTYPE_colmn) {
+        LLVMValueRef colptr_base = LLVMBuildLoad(builder, ((ColumnOperation*)op)->column->llvm_ptr, "&col");
+        LLVMValueRef colptr_offset = LLVMBuildGEP(builder, colptr_base, &index, 1, "&col[index]");
+        return LLVMBuildLoad(builder, colptr_offset, "col[index]");
+    } else if (op->type == OPTYPE_const) {
+        return LLVMConstReal(LLVMDoubleType(), ((ConstantOperation*)op)->value);
+    }
+    return NULL;
+}
+
 static Table*
 ExecuteQuery(Query *query) {
-    // TODO: Implement the execution engine of the database
+    size_t i;
 
-    // This function takes a Query object as input, and should return a table
-    // The query object has the following structure:
-    /*
-     *  typedef struct {
-     *      Operation *select;
-     *      char *table;
-     *      Operation *where;
-     *      ColumnList *columns;
-     *  } Query;
-     */
-    // "select" is the operation that describe the SELECT part of the query
-    //   for simplicity, we only allow one statement in the SELECT clause
-    // "table" is just the table name in the FROM clause
-    // "where" is the operation that describes the WHERE condition
-    // "columns" is a list of all columns that are part of the query
+    clock_t tic = clock();
+    LLVMModuleRef module = LLVMModuleCreateWithName("LoopModule");
+    LLVMOptimizeModuleForTarget(module);
 
-    // Both "Select" and "Where" are an Operation structure,
-    // this structure contains the Operation that has to be performed
-    // An operation is one of the following types:
-    // 
-    // 1) ConstantOperation (op->type == OPTYPE_const)
-    //    Holds a constant double value: ((ConstantOperation*)op)->value
-    // 2) ColumnOperation (op->type == OPTYPE_colmn)
-    //    Holds a reference to a column that occurs in the table
-    //      ((ColumnOperation*)op)->column
-    //    - The column stores an array of doubles in column->data
-    //    - The amount of values in the column is available in column->size
-    // 3) BinaryOperation (op->type == OPTYPE_binop)
-    //    Holds an actual binary operation
-    //    - The type of the operation is stored in ((BinaryOperation*)op)->optype
-    //       a list of supported types can be found at the top of parser.h
-    //       note that there are no "difficult" operations (i.e. no pipeline breakers)
-    //    - The LHS of the operation ((BinaryOperation*)op)->left
-    //    - The RHS of the operation ((BinaryOperation*)op)->right
-    //    Binary operations can be nested to create complex expressions
-    //      i.e. ->left can be a BinaryOperation as well
+    LLVMTypeRef double_type = LLVMDoubleType();
+    LLVMTypeRef doubleptr_type = LLVMPointerType(double_type, 0);
+    LLVMTypeRef doubleptrptr_type = LLVMPointerType(doubleptr_type, 0);
+    LLVMTypeRef int64_type = LLVMInt64Type();
 
-    // To correctly answer queries, you should handle both query->select and 
-    //   query->where using JIT compilation
+    LLVMTypeRef return_type = int64_type;
+    LLVMTypeRef param_types[] = { doubleptr_type, doubleptrptr_type, 
+        int64_type};
 
-    // Hint: Write a function to handle to handle a specific query in C,
-    //  I recommend starting with only selections
-    //  such as 'SELECT x+y+z FROM demo;'
-    // then use the command "clang file.c -S -emit-llvm -o -"
-    // to compile the C function to LLVM IR to get an idea of how to do it in LLVM
+    LLVMTypeRef prototype = LLVMFunctionType(return_type, param_types, 3, 0);
+    LLVMValueRef function = LLVMAddFunction(module, "loop", prototype);
 
-    // note that your function will have to accept an arbitrary amount of input columns
-    // (how would you do that in C?)
+    LLVMBuilderRef builder = LLVMCreateBuilder();
 
-    // For a simple for-loop implementation using LLVM JIT Compilation, see llvmtest.c
-    // You can copy most of the code from there as a start to your execution engine
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlock(function, "entry");
+    LLVMBasicBlockRef condition = LLVMAppendBasicBlock(function, "condition");
+    LLVMBasicBlockRef body_condition = NULL;
+    if (query->where) {
+        body_condition = LLVMAppendBasicBlock(function, "body_condition");
+    }
+    LLVMBasicBlockRef body_main = LLVMAppendBasicBlock(function, "body_main");
+    LLVMBasicBlockRef increment = LLVMAppendBasicBlock(function, "increment");
+    LLVMBasicBlockRef end = LLVMAppendBasicBlock(function, "end");
 
-    // For now, we implement a basic engine that only implements selection
+    size_t columns = GetColCount(query->columns);
+    size_t elements = query->columns->column->size;
 
-     (void) InitializePassManager;
-     (void) LLVMOptimizeModuleForTarget;
-
-    if (query->where != NULL) {
-        fprintf(stdout, "Error: WHERE operation is currently not supported.\n");
-        return NULL;
+    LLVMValueRef index_addr;
+    LLVMValueRef result_index_addr = NULL;
+    LLVMPositionBuilderAtEnd(builder, entry);
+    {
+        if (query->where) {
+            // if there is a WHERE condition we also need to keep track of the amount of elements
+            result_index_addr = LLVMBuildAlloca(builder, int64_type, "result_index");
+            LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 1), result_index_addr);
+        }
+        i = 0;
+        for(ColumnList *col = query->columns; col; col = col->next, i++) {
+            if (col->column) {
+                LLVMValueRef constone = LLVMConstInt(int64_type, i, true);
+                LLVMValueRef colptrptr = LLVMBuildGEP(builder, LLVMGetParam(function, 1), &constone, 1, "&inputs[i]");
+                LLVMValueRef colptr = LLVMBuildLoad(builder, colptrptr, "inputs[i]");
+                col->column->llvm_ptr = LLVMBuildAlloca(builder, doubleptr_type, "col*");
+                LLVMBuildStore(builder, colptr, col->column->llvm_ptr);
+            }
+        }
+        index_addr = LLVMBuildAlloca(builder, int64_type, "index");
+        LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 1), index_addr);
+        LLVMBuildBr(builder, condition);
     }
 
-    Operation* select = query->select;
-    Column *column = NULL;
-    if (select->type != OPTYPE_colmn) {
-        fprintf(stdout, "Error: Currently only supports column selections.\n");
-        return NULL;
-    } else {
-        ColumnOperation *colop = (ColumnOperation*) select;
-        column = CreateColumn(colop->column->data, colop->column->size);
+    LLVMPositionBuilderAtEnd(builder, condition);
+    {
+        LLVMValueRef index = LLVMBuildLoad(builder, index_addr, "[index]");
+        LLVMValueRef cond = LLVMBuildICmp(builder, LLVMIntSLT, index, LLVMGetParam(function, 2), "index < size");
+        LLVMBuildCondBr(builder, cond, query->where ? body_condition : body_main, end);
     }
+    if (query->where) {
+        LLVMPositionBuilderAtEnd(builder, body_condition);
+        {
+            // this is basically the WHERE clause
+            // if the WHERE clause is true we compute the SELECT
+            LLVMValueRef index = LLVMBuildLoad(builder, index_addr, "[index]");
+
+            // todo: operation
+            LLVMValueRef where_condition = PerformOperation(query->where, builder, index);
+
+            LLVMBuildCondBr(builder, where_condition, body_main, increment);
+        }
+    }
+    LLVMPositionBuilderAtEnd(builder, body_main);
+    {   
+        // this computes the SELECT clause
+        LLVMValueRef index = LLVMBuildLoad(builder, index_addr, "[index]");
+
+        // todo: operation
+        LLVMValueRef result = PerformOperation(query->select, builder, index);
+
+        LLVMValueRef result_index = index;
+        if (query->where) {
+            // if we have a WHERE clause the current result index can differ from the index
+            result_index = LLVMBuildLoad(builder, result_index_addr, "[result_index]");
+        } 
+
+        LLVMValueRef result_addr = LLVMBuildGEP(builder, LLVMGetParam(function, 0), &result_index, 1, "&result[result_index]");
+        LLVMBuildStore(builder, result, result_addr);
+        if (query->where) {
+            // increment result index
+            LLVMValueRef result_indexpp = LLVMBuildAdd(builder, result_index, LLVMConstInt(int64_type, 1, 1), "index++");
+            LLVMBuildStore(builder, result_indexpp, result_index_addr);
+        }
+
+        LLVMBuildBr(builder, increment);
+    }
+    LLVMPositionBuilderAtEnd(builder, increment);
+    {
+        LLVMValueRef index = LLVMBuildLoad(builder, index_addr, "[index]");
+        LLVMValueRef indexpp = LLVMBuildAdd(builder, index, LLVMConstInt(int64_type, 1, 1), "index++");
+        LLVMBuildStore(builder, indexpp, index_addr);
+        LLVMBuildBr(builder, condition);
+    }
+    LLVMPositionBuilderAtEnd(builder, end);
+    {
+        LLVMValueRef elements = NULL;
+        if (query->where) {
+            elements = LLVMBuildLoad(builder, result_index_addr, "[result_index]");
+        } else {
+            elements = LLVMBuildLoad(builder, index_addr, "[index]");
+        }
+
+        LLVMBuildRet(builder, elements);
+    }
+
+    LLVMPassManagerRef passManager = InitializePassManager(module);
+    LLVMRunFunctionPassManager(passManager, function);
+    
+    LLVMDumpModule(module);
+
+    struct LLVMMCJITCompilerOptions options;
+    LLVMInitializeMCJITCompilerOptions(&options, sizeof(options));
+    LLVMExecutionEngineRef engine;
+    char *error = NULL;
+    if (LLVMCreateMCJITCompilerForModule(&engine, module, &options, sizeof(options), &error) != 0) {
+        fprintf(stderr, "failed to create execution engine\n");
+        abort();
+    }
+    if (error) {
+        fprintf(stderr, "error: %s\n", error);
+        LLVMDisposeMessage(error);
+        exit(EXIT_FAILURE);
+    }
+
+    fptr loop_func = (fptr) LLVMGetFunctionAddress(engine, "loop");
+    if (!loop_func) {
+        printf("Failed to get function pointer.\n");
+        exit(1);
+    }
+    clock_t toc = clock();
+    printf("Compilation: %f seconds\n", (double)(toc - tic) / CLOCKS_PER_SEC);
+    double **inputs = malloc(sizeof(double*) * columns);
+    i = 0;
+    for(ColumnList *col = query->columns; col; col = col->next, i++) {
+        if (col->column) {
+            inputs[i] = col->column->data;
+        }
+    }
+    double *result = malloc(sizeof(double) * elements);
+    size_t res_elements = loop_func(result, inputs, elements);
+
+    Column *column = CreateColumn(result, res_elements);
     return CreateTable("Result", column);
 }
 
@@ -116,36 +234,36 @@ int main(int argc, char** argv) {
     for(int i = 1; i < argc; i++) {
         char *arg = argv[i];
         if (strcmp(arg, "--help") == 0) {
-            fprintf(stdout, "RembranDB Options.\n");
-            fprintf(stdout, "  -opt              Enable  LLVM optimizations.\n");
-            fprintf(stdout, "  -no-print         Do not print query results.\n");
-            fprintf(stdout, "  -no-llvm          Do not print LLVM instructions.\n");
-            fprintf(stdout, "  -s \"stmnt\"        Execute \"stmnt\" and exit.\n");
+            printf("RembranDB Options.\n");
+            printf("  -opt              Enable  LLVM optimizations.\n");
+            printf("  -no-print         Do not print query results.\n");
+            printf("  -no-llvm          Do not print LLVM instructions.\n");
+            printf("  -s \"stmnt\"        Execute \"stmnt\" and exit.\n");
             return 0;
         } else if (strcmp(arg, "-opt") == 0) {
-            fprintf(stdout, "Optimizations enabled.\n");
+            printf("Optimizations enabled.\n");
             enable_optimizations = true;
         } else if (strcmp(arg, "-no-print") == 0) {
-            fprintf(stdout, "Printing output disabled.\n");
+            printf("Printing output disabled.\n");
             print_result = false;
         } else if (strcmp(arg, "-no-llvm") == 0) {
-            fprintf(stdout, "Printing LLVM disabled.\n");
+            printf("Printing LLVM disabled.\n");
             print_llvm = false;
         } else if (strcmp(arg, "-s") == 0) {
             execute_statement = true;
         } else if (execute_statement) {
             statement = arg;
         } else {
-            fprintf(stdout, "Unrecognized command line option \"%s\".\n", arg);
+            printf("Unrecognized command line option \"%s\".\n", arg);
             exit(1);
         }
     }
     if (!execute_statement) {
-        fprintf(stdout, "# RembranDB server v0.0.0.1\n");
-        fprintf(stdout, "# Serving table \"demo\", with no support for multithreading\n");
-        fprintf(stdout, "# Did not find any available memory (didn't look for any either)\n");
-        fprintf(stdout, "# Not listening to any connection requests.\n");
-        fprintf(stdout, "# RembranDB/SQL module loaded\n");
+        printf("# RembranDB server v0.0.0.1\n");
+        printf("# Serving table \"demo\", with no support for multithreading\n");
+        printf("# Did not find any available memory (didn't look for any either)\n");
+        printf("# Not listening to any connection requests.\n");
+        printf("# RembranDB/SQL module loaded\n");
     }
     Initialize();
 
@@ -169,7 +287,7 @@ int main(int argc, char** argv) {
             Table *tbl = ExecuteQuery(query);
             clock_t toc = clock();
 
-            fprintf(stdout, "Total Runtime: %f seconds\n", (double)(toc - tic) / CLOCKS_PER_SEC);
+            printf("Total Runtime: %f seconds\n", (double)(toc - tic) / CLOCKS_PER_SEC);
 
             if (print_result) {
                 PrintTable(tbl);
@@ -220,7 +338,7 @@ static LLVMPassManagerRef InitializePassManager(LLVMModuleRef module) {
 }
 
 static void Initialize(void) {
-    // LLVM boilerplate initialization code
+    // LLVM initialization code
     LLVMLinkInMCJIT();
     LLVMInitializeNativeTarget();
     LLVMInitializeAllTargetMCs();
