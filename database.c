@@ -190,8 +190,8 @@ ExecuteQuery(Query *query) {
         LLVMBuildRet(builder, elements);
     }
 
-    LLVMPassManagerRef passManager = InitializePassManager(module);
-    LLVMRunFunctionPassManager(passManager, function);
+    //LLVMPassManagerRef passManager = InitializePassManager(module);
+    //LLVMRunFunctionPassManager(passManager, function);
     
     LLVMDumpModule(module);
 
