@@ -33,6 +33,8 @@ static bool print_llvm = true;
 static bool execute_statement = false;
 static char* statement;
 
+#define OVERFLOW_CODE 1
+
 // long long loop(double* result, double **inputs, long long size)
 // returns: number of elements inserted
 typedef lng (*fptr)(double*,double**,lng);
@@ -98,8 +100,10 @@ ExecuteQuery(Query *query) {
         body_condition = LLVMAppendBasicBlock(function, "body_condition");
     }
     LLVMBasicBlockRef body_main = LLVMAppendBasicBlock(function, "body_main");
+    LLVMBasicBlockRef body_store = LLVMAppendBasicBlock(function, "body_store");
     LLVMBasicBlockRef increment = LLVMAppendBasicBlock(function, "increment");
     LLVMBasicBlockRef end = LLVMAppendBasicBlock(function, "end");
+    LLVMBasicBlockRef overflow_error = LLVMAppendBasicBlock(function, "overflow_error");
 
     size_t columns = GetColCount(query->columns);
     size_t elements = query->columns->column->size;
@@ -121,6 +125,7 @@ ExecuteQuery(Query *query) {
                 LLVMValueRef colptr = LLVMBuildLoad(builder, colptrptr, "inputs[i]");
                 col->column->llvm_ptr = LLVMBuildAlloca(builder, doubleptr_type, "col*");
                 LLVMBuildStore(builder, colptr, col->column->llvm_ptr);
+
             }
         }
         index_addr = LLVMBuildAlloca(builder, int64_type, "index");
@@ -147,29 +152,41 @@ ExecuteQuery(Query *query) {
             LLVMBuildCondBr(builder, where_condition, body_main, increment);
         }
     }
+
+    LLVMValueRef index_body;
+    LLVMValueRef result_value;
     LLVMPositionBuilderAtEnd(builder, body_main);
     {   
         // this computes the SELECT clause
-        LLVMValueRef index = LLVMBuildLoad(builder, index_addr, "[index]");
+        index_body = LLVMBuildLoad(builder, index_addr, "[index]");
 
         // todo: operation
-        LLVMValueRef result = PerformOperation(query->select, builder, index);
+        result_value = PerformOperation(query->select, builder, index_body);
 
-        LLVMValueRef result_index = index;
+        LLVMValueRef overflow_occurred = LLVMBuildFCmp(builder, LLVMRealOEQ, result_value, LLVMConstReal(double_type, INFINITY), "cmp");
+        LLVMBuildCondBr(builder, overflow_occurred, overflow_error, body_store);
+    }
+
+    LLVMPositionBuilderAtEnd(builder, body_store);
+    {   
+        LLVMValueRef result_index = index_body;
         if (query->where) {
             // if we have a WHERE clause the current result index can differ from the index
             result_index = LLVMBuildLoad(builder, result_index_addr, "[result_index]");
         } 
-
         LLVMValueRef result_addr = LLVMBuildGEP(builder, LLVMGetParam(function, 0), &result_index, 1, "&result[result_index]");
-        LLVMBuildStore(builder, result, result_addr);
+        LLVMBuildStore(builder, result_value, result_addr);
         if (query->where) {
             // increment result index
             LLVMValueRef result_indexpp = LLVMBuildAdd(builder, result_index, LLVMConstInt(int64_type, 1, 1), "index++");
             LLVMBuildStore(builder, result_indexpp, result_index_addr);
         }
-
         LLVMBuildBr(builder, increment);
+    }
+
+    LLVMPositionBuilderAtEnd(builder, overflow_error);
+    {
+        LLVMBuildRet(builder, LLVMConstInt(int64_type, OVERFLOW_CODE, 1));
     }
     LLVMPositionBuilderAtEnd(builder, increment);
     {
@@ -225,6 +242,10 @@ ExecuteQuery(Query *query) {
     }
     double *result = malloc(sizeof(double) * elements);
     size_t res_elements = loop_func(result, inputs, elements);
+    if (res_elements == OVERFLOW_CODE) {
+        fprintf(stderr, "ERROR: Overflow in calculation!\n");
+        return NULL;
+    }
 
     Column *column = CreateColumn(result, res_elements);
     return CreateTable("Result", column);
